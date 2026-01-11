@@ -5,181 +5,232 @@ import threading
 import time
 import aiohttp
 import asyncio
-from typing import Optional, Dict, Tuple
+import secrets
+
+INTEGRITY_URL = "https://gql.twitch.tv/integrity"
+GQL_URL = "https://gql.twitch.tv/gql"
+CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 class TwitchFollower:
     def __init__(self, log_callback=print):
         self.log_callback = log_callback
         self.followed_records = {}
-        # Cache for integrity tokens: {oauth_token: (integrity_token, expiry_timestamp)}
-        self.integrity_cache = {}
         self.lock = threading.Lock()
         self.running = False
         self.proxies = self._load_proxies()
 
-    # ... (_log, _load_proxies, _load_tokens, get_user_id, _fetch_user_id_async remain the same) ...
+    def _log(self, message):
+        self.log_callback(message)
 
-    async def _fetch_integrity_token(self, oauth_token: str, proxy_url: Optional[str] = None) -> Optional[Dict]:
+    def _load_proxies(self):
+        proxies = []
+        if os.path.exists("proxies.txt"):
+            with open("proxies.txt", "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and '://' not in line:
+                        line = f"http://{line}"
+                    if line:
+                        proxies.append(line)
+        return proxies
+
+    def _load_tokens(self):
+        tokens = []
+        if os.path.exists("tokens.txt"):
+            with open("tokens.txt", "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        tokens.append(line)
+        return tokens
+
+    async def _get_integrity_token(self, session, payload_json):
         """
-        Fetches an integrity token from Twitch's integrity endpoint for a given OAuth token.
-        Returns a dict with 'token' and 'expires_in' if successful.
+        Request an integrity token from Twitch's integrity endpoint.
         """
+        device_id = secrets.token_hex(16)
         headers = {
-            "Client-Id": "kimne78kx3ncx6brgo4mv6wki5h1ko",
-            "Authorization": f"OAuth {oauth_token}",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "Content-Type": "application/json"
+            "Client-Id": CLIENT_ID,
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+            "X-Device-Id": device_id
         }
-
-        try:
-            connector = aiohttp.TCPConnector(ssl=False)
-            timeout = aiohttp.ClientTimeout(total=30)
-
-            async with aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout
-            ) as session:
-                async with session.post(
-                    "https://gql.twitch.tv/integrity",
-                    headers=headers,
-                    proxy=proxy_url
-                ) as response:
-                    
-                    if response.status == 200:
-                        data = await response.json()
-                        # Expected response format: {"token": "v4.public...", "expires_in": 3600}
-                        if data.get("token"):
-                            # Calculate expiry time (current time + expires_in seconds)
-                            expiry_time = time.time() + data.get("expires_in", 3600)
-                            return {
-                                "token": data["token"],
-                                "expires_in": data.get("expires_in", 3600),
-                                "expiry_time": expiry_time
-                            }
-                    else:
-                        self._log(f"Integrity token fetch failed for token {oauth_token[:10]}...: Status {response.status}")
-                        return None
-                        
-        except Exception as e:
-            self._log(f"Error fetching integrity token for {oauth_token[:10]}...: {e}")
-            return None
-
-    async def _get_valid_integrity_token(self, oauth_token: str, proxy_url: Optional[str] = None) -> Optional[str]:
-        """
-        Retrieves a valid integrity token from cache or fetches a new one.
-        Returns the integrity token string if successful.
-        """
-        current_time = time.time()
-        
-        # Check cache for valid token
-        if oauth_token in self.integrity_cache:
-            cached_data = self.integrity_cache[oauth_token]
-            # Check if token is still valid (with 60-second buffer)
-            if current_time < cached_data["expiry_time"] - 60:
-                return cached_data["token"]
-        
-        # Fetch new token
-        integrity_data = await self._fetch_integrity_token(oauth_token, proxy_url)
-        if integrity_data:
-            self.integrity_cache[oauth_token] = integrity_data
-            return integrity_data["token"]
-        
+        async with session.post(INTEGRITY_URL, headers=headers, data=payload_json) as response:
+            if response.status == 200:
+                data = await response.json()
+                token = data.get("token")
+                if token:
+                    return token
         return None
 
-    async def _execute_follow_request(self, target_id, token, target_username):
-        try:
-            # Get proxy URL first (needed for integrity token fetch)
-            proxy_url = None
-            if self.proxies:
-                proxy_url = random.choice(self.proxies)
-                self._log(f"Using proxy: {proxy_url} for token: {token[:10]}...")
+    def get_user_id(self, user):
+        payload = json.dumps([{
+            "operationName": "GetIDFromLogin",
+            "variables": {"login": user},
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": "94e82a7b1e3c21e186daa73ee2afc4b8f23bade1fbbff6fe8ac133f50a2f58ca"
+                }
+            }
+        }])
 
-            # Get integrity token
-            integrity_token = await self._get_valid_integrity_token(token, proxy_url)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(self._fetch_user_id_async(payload))
+        loop.close()
+        return result
+
+    async def _fetch_user_id_async(self, payload_json):
+        proxy_url = random.choice(self.proxies) if self.proxies else None
+        connector = aiohttp.TCPConnector(ssl=False)
+        timeout = aiohttp.ClientTimeout(total=30)
+
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            integrity_token = await self._get_integrity_token(session, payload_json)
             if not integrity_token:
-                self._log(f"Failed to get integrity token for {token[:10]}...")
+                self._log("Failed to get integrity token")
                 return False
 
             headers = {
-                "Accept": "application/json",
-                "Accept-Language": "en-US",
-                "Authorization": f"OAuth {token}",
-                "Client-Integrity": integrity_token,  # REQUIRED: Integrity token header[citation:1][citation:4]
-                "Client-Id": "kimne78kx3ncx6brgo4mv6wki5h1ko",
+                "Client-Id": CLIENT_ID,
                 "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                "User-Agent": USER_AGENT,
+                "Authorization": f"OAuth {integrity_token}"
             }
 
-            payload = json.dumps([{
-                "operationName": "FollowButton_FollowUser",  # Updated operation name
-                "variables": {
-                    "input": {
-                        "targetID": str(target_id),
-                        "disableNotifications": False
-                    }
-                },
-                "extensions": {
-                    "persistedQuery": {
-                        "version": 1,
-                        "sha256Hash": "51956f0c469f54e60211ea4e6a34b597d45c1c37b9664d4b62096a1ac03be9e6"  # Updated hash[citation:1]
-                    }
+            try:
+                async with session.post(GQL_URL, headers=headers, data=payload_json, proxy=proxy_url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data[0]["data"]["user"]["id"]
+            except Exception as e:
+                self._log(f"Error fetching user ID: {e}")
+        return False
+
+    async def _execute_follow_request(self, target_id, token):
+        payload = json.dumps([{
+            "operationName": "FollowUserMutation",
+            "variables": {
+                "targetId": str(target_id),
+                "disableNotifications": False
+            },
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": "cd112d9483ede85fa0da514a5657141c24396efbc7bac0ea3623e839206573b8"
                 }
-            }])
+            }
+        }])
 
-            connector = aiohttp.TCPConnector(ssl=False)
-            timeout = aiohttp.ClientTimeout(total=30)
-            
-            async with aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout
-            ) as session:
-                async with session.post(
-                    "https://gql.twitch.tv/gql",
-                    data=payload,
-                    headers=headers,
-                    proxy=proxy_url
-                ) as response:
-                    
+        proxy_url = random.choice(self.proxies) if self.proxies else None
+        connector = aiohttp.TCPConnector(ssl=False)
+        timeout = aiohttp.ClientTimeout(total=30)
+
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            integrity_token = await self._get_integrity_token(session, payload)
+            if not integrity_token:
+                return False
+
+            headers = {
+                "Client-Id": CLIENT_ID,
+                "Authorization": f"OAuth {token}",
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+                "X-Device-Id": secrets.token_hex(16),
+                "X-Integrity-Token": integrity_token
+            }
+
+            try:
+                async with session.post(GQL_URL, headers=headers, data=payload, proxy=proxy_url) as response:
                     result_text = await response.text()
-                    
-                    if response.status in (200, 204):
-                        if "errors" not in result_text.lower():
-                            return True
-                    
-                    self._log(f"Follow request failed for {token[:10]}...: Status {response.status}, Response: {result_text[:200]}")
-                    return False
-                    
-        except Exception as e:
-            self._log(f"Request failed with error: {e}")
-            return False
+                    if response.status in (200, 204) and "errors" not in result_text.lower():
+                        return True
+            except Exception as e:
+                self._log(f"Follow request failed: {e}")
+        return False
 
-    # ... (_follow_worker, execute_follows, start, _run_operation, stop remain the same) ...
+    async def _follow_worker(self, target_id, tokens_list, max_follows, stats):
+        while self.running and stats["completed"] < max_follows:
+            with self.lock:
+                unused_tokens = [
+                    token for token in tokens_list
+                    if token not in self.followed_records or target_id not in self.followed_records[token]
+                ]
+                if not unused_tokens:
+                    break
+                token = random.choice(unused_tokens)
+
+            success = await self._execute_follow_request(target_id, token)
+            if success:
+                with self.lock:
+                    stats["completed"] += 1
+                    if token not in self.followed_records:
+                        self.followed_records[token] = []
+                    self.followed_records[token].append(target_id)
+                    self._log(f"Followed {stats['completed']}/{max_follows}")
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+
+    def execute_follows(self, target_id, follow_count, tokens_data):
+        completion_event = threading.Event()
+
+        def run_loop():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            stats = {"completed": 0}
+            tasks = [loop.create_task(self._follow_worker(target_id, tokens_data, follow_count, stats))
+                     for _ in range(min(50, follow_count, len(tokens_data)))]
+            loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+            completion_event.set()
+            loop.close()
+
+        threading.Thread(target=run_loop, daemon=True).start()
+        return completion_event
+
+    def start(self, username, count):
+        if self.running:
+            self._log("Follower already running")
+            return
+        self.running = True
+        threading.Thread(target=self._run_operation, args=(username, count), daemon=True).start()
+
+    def _run_operation(self, username, count):
+        self._log(f"Fetching ID for {username}...")
+        user_id = self.get_user_id(username)
+        if not user_id:
+            self._log("Failed to get user ID")
+            self.running = False
+            return
+
+        tokens = self._load_tokens()
+        if not tokens:
+            self._log("No tokens found")
+            self.running = False
+            return
+
+        self._log(f"Starting follow process for {count} follows")
+        completion = self.execute_follows(user_id, count, tokens)
+        completion.wait()
+        self.running = False
+        self._log("Follow operation finished")
+
+    def stop(self):
+        self.running = False
+        self._log("Stopping operation")
 
 if __name__ == "__main__":
     bot = TwitchFollower(print)
-    
-    print("Twitch Follower Bot (Updated with Integrity Endpoint)")
-    print("----------------------------------------------------")
-    
     username = input("Target username: ").strip()
-    
     try:
         count = int(input("Number of follows: ").strip())
     except ValueError:
-        print("Invalid number. Using default: 10")
         count = 10
-    
     bot.start(username, count)
-    
-    print("\nFollow operation started. Press Ctrl+C to stop.")
-    
+
     try:
         while bot.running:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopping...")
         bot.stop()
-        time.sleep(2)
-    
-    print("Bot stopped.")
+
